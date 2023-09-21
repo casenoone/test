@@ -1,1 +1,729 @@
-测试测试测试测试
+#pragma once
+
+#include <iostream>
+#include <unordered_map>
+#include <vector>
+#include <cassert>
+#include <tuple>
+#include <tbb/parallel_for.h>
+#include <tbb/spin_mutex.h>
+#include <thread>
+#include "../vector2.hpp"
+
+//多层稀疏网格实现
+//2023.8.8
+
+template <class T>
+class MutiSparseGrid2{
+public:
+	MutiSparseGrid2(int datasize_, int pointersize_, int hashsize_);
+	MutiSparseGrid2(int datasize_, int pointersize_, int hashsize_, 
+		const std::tuple<bool, int>& inform );
+	//这里可实现char的位压缩
+	struct DataBlock {
+		DataBlock(int len, const std::tuple<bool, int>& compressInform);
+		T& operator()(int i, int j, int dataBlockRes);
+
+	public:
+		void write(int i, int j, T value, int dataBlockRes, const std::tuple<bool, int>& compressedState);
+		T read(int i, int j, int dataBlockRes, const std::tuple<bool, int>& compressedState);
+	private:
+		std::vector<T> m_dataBlock;
+	};
+
+
+	struct PointerBlock {
+		PointerBlock() = default;
+		PointerBlock(int len);
+		DataBlock* operator()(int i, int j, int pointerRes);
+		void allocateMemory(int i, int j, int pointerRes, int dataRes, const std::tuple<bool, int>& compressInform);
+		
+	private:
+		std::vector<std::unique_ptr<DataBlock>> m_pointerBlock;
+		//std::vector<std::unique_ptr<tbb::spin_mutex> >m_mtx;
+		std::vector<std::unique_ptr<std::mutex> >m_mtx;
+
+	};
+
+
+	struct MutiSparseGridHash {
+		std::size_t operator()(std::tuple<int, int> const& key)const {
+			auto const& [x, y] = key;
+			return (x * 2718281828) ^ (y * 31415926535);
+		}
+	};
+
+public:
+	T sample(const Vector2D& x)const;
+
+	void write(int i, int j, T value);
+	T read(int i, int j);
+	
+private:
+
+	int toUnorderedMapItemIndex(int i)const;
+	int toPointerBlockIndex(int i)const;
+	int toDataBlockIndex(int i)const;
+
+	DataBlock* getCurrentDataBlockPointer(int i, int j, bool isRead);
+
+	void rectifyCompressdNum();
+
+
+private:
+	std::unordered_map<std::tuple<int, int>, PointerBlock, MutiSparseGridHash> _m_data;
+	
+	int _m_DataBlock_Res = 2;
+	int _m_PointerBlock_Res = 1;
+	int _m_Muti_SparseGrid_Res ;
+
+	int resolution;
+
+	std::tuple<bool, int> _compressInform;
+
+
+};
+
+
+
+
+
+template<class T>
+MutiSparseGrid2<T>::DataBlock::DataBlock(int len, const std::tuple<bool, int>& compressInform) {
+	//首先判断一下是否开启了位压缩
+	if (std::get<0>(compressInform)) {
+		m_dataBlock.resize(len * std::ceil((double)len / std::get<1>(compressInform)));
+	}
+	else {
+		m_dataBlock.resize(len * len);
+	}
+
+}
+
+template<class T>
+T& MutiSparseGrid2<T>::DataBlock::operator()(int i, int j, int dataBlockRes) {
+	return m_dataBlock[i + j * dataBlockRes];
+}
+
+//在这里实现具体的位压缩读算法
+//这里可以考虑专门封装成位运算类，方便使用
+template<class T>
+inline void MutiSparseGrid2<T>::DataBlock::write(int i, int j, T value, int dataBlockRes, const std::tuple<bool, int>& compressedInform)
+{
+	//思路：
+	int n_num = std::get<1>(compressedInform);
+
+	//2.获得压缩后的下标(存疑)
+	//注意data的数组大小一定要向上取整，记得在dataBlock构造函数中改正
+	int c_i = i;
+	int c_j = j / n_num;
+
+	//3.获得当前格子的真实值
+	auto &realValue = (*this)(c_i, c_j, dataBlockRes);
+	if (std::get<0>(compressedInform) == false) {
+		(*this)(i, j, dataBlockRes) = value;
+		return;
+	}
+	//4.进行写入,写入之前要先把相应位置置为0
+	//bit_j:char内的相对位置
+	int bit_j = j % n_num;
+
+	for (int idx = bit_j * n_num; idx < bit_j * n_num + n_num; ++idx) {
+		realValue &= ~(1 << idx);
+	}
+	auto tempValue1 = value << bit_j * n_num;
+	realValue |= tempValue1;
+}
+
+//这里或许可以进一步进行位运算
+//太繁琐了，后面回来再优化吧
+
+template<class T>
+inline T MutiSparseGrid2<T>::DataBlock::read(int i, int j, int dataBlockRes, const std::tuple<bool, int>& compressedInform)
+{
+	int n_num = std::get<1>(compressedInform);
+	int c_i = i;
+	int c_j = j / n_num;
+
+	auto realValue = (*this)(c_i, c_j, dataBlockRes);
+	if (std::get<0>(compressedInform) == false) {
+		return (*this)(i, j, dataBlockRes);
+	}
+	int bit_j = j % n_num;
+
+	//先左移，再右移
+	int leftMovingNum = (8 / n_num - 1 - bit_j) * n_num;
+	int rightMovingNum = 6;
+
+	realValue = realValue << leftMovingNum;
+	realValue = realValue >> rightMovingNum;
+
+	//为什么会出现-2？这是什么原因？
+	//有符号 的问题
+	return realValue;
+}
+
+
+
+
+template<class T>
+MutiSparseGrid2<T>::PointerBlock::PointerBlock(int len) {
+	m_pointerBlock.resize(len * len);
+	/*for (int i = 0; i < len * len; ++i) {
+		//auto temp_mtx = std::make_unique<tbb::spin_mutex>();
+		auto temp_mtx = std::make_unique<std::mutex>();
+		m_mtx.push_back(std::move(temp_mtx));
+	}*/
+}
+
+//注意这里为什么要加typename
+template<class T>
+typename MutiSparseGrid2<T>::DataBlock* MutiSparseGrid2<T>::PointerBlock::operator()(int i, int j, int pointerRes) {
+	return m_pointerBlock[i + j * pointerRes].get();
+}
+
+template<class T>
+
+//注意，这里是线程不安全的
+//因为多个线程执行时，首先都会检测到指针为空
+//然后都会执行一次，这就会导致内存被多次分配
+//要去锁一下
+void MutiSparseGrid2<T>::PointerBlock::allocateMemory(int i, int j, int pointerRes, int dataRes, const std::tuple<bool, int>& compressInform) {
+	if (m_pointerBlock[i + j * pointerRes] == nullptr) 
+	{
+		//std::lock_guard<std::mutex> _(*(m_mtx[i + j * pointerRes]));
+		
+		if (m_pointerBlock[i + j * pointerRes] == nullptr)
+			m_pointerBlock[i + j * pointerRes] = std::make_unique<MutiSparseGrid2<T>::DataBlock>(dataRes, compressInform);
+	}
+	
+}
+
+
+
+template<class T>
+MutiSparseGrid2<T>::MutiSparseGrid2(int datasize_, int pointersize_, int hashsize_) :
+	_m_DataBlock_Res(datasize_),
+	_m_PointerBlock_Res(pointersize_),
+	_m_Muti_SparseGrid_Res(hashsize_) {
+	resolution = datasize_ * hashsize_ * pointersize_;
+	_compressInform = std::make_tuple(false, 1);
+	
+	
+}
+
+template<class T>
+MutiSparseGrid2<T>::MutiSparseGrid2(int datasize_, int pointersize_, int hashsize_,
+	const std::tuple<bool, int>& inform) :
+	MutiSparseGrid2(datasize_, pointersize_, hashsize_)
+{
+	_compressInform = inform;
+	//这里加一个类型判断，暂时限制只有T = char时允许使用位压缩
+
+	//压缩位数必须是2的整数次幂，如果不是，则纠正
+	rectifyCompressdNum();
+}
+
+
+template<class T>
+T MutiSparseGrid2<T>::sample(const Vector2D& x)const {
+	T a;
+	return a;
+}
+
+template<class T>
+void MutiSparseGrid2<T>::write(int i, int j, T value) {
+	MutiSparseGrid2<T>::DataBlock* currentDataBlock = getCurrentDataBlockPointer(i, j, false);
+	//4. 将(i,j)转换为DataBlock的下标，进行读写操作
+	int d_i = toDataBlockIndex(i);
+	int d_j = toDataBlockIndex(j);
+
+	currentDataBlock->write(d_i, d_j, value, _m_DataBlock_Res, _compressInform);
+}
+
+
+//这里有问题
+template<class T>
+T MutiSparseGrid2<T>::read(int i, int j) {
+	//if(std::get<0>(_compressInform) == false)return
+	MutiSparseGrid2<T>::DataBlock* currentDataBlock = getCurrentDataBlockPointer(i, j, true);
+	//4. 将(i,j)转换为DataBlock的下标，进行读写操作
+	int d_i = toDataBlockIndex(i);
+	int d_j = toDataBlockIndex(j);
+	if (currentDataBlock)
+	{
+		return currentDataBlock->read(d_i, d_j, _m_DataBlock_Res, _compressInform);
+	}
+	else
+	{
+		return static_cast<T>(0);
+	}
+}
+
+template<class T>
+int MutiSparseGrid2<T>::toUnorderedMapItemIndex(int i)const {
+
+	if (i >= resolution || i < 0) assert(NULL);
+	int temp_i1 = i / (_m_PointerBlock_Res * _m_DataBlock_Res);
+	return temp_i1;
+}
+
+template<class T>
+int MutiSparseGrid2<T>::toPointerBlockIndex(int i)const {
+	return (i / _m_DataBlock_Res) % _m_PointerBlock_Res;
+}
+
+template<class T>
+int MutiSparseGrid2<T>::toDataBlockIndex(int i)const {
+	return i  % _m_DataBlock_Res;
+}
+
+template <class T>
+typename MutiSparseGrid2<T>::DataBlock* MutiSparseGrid2<T>::getCurrentDataBlockPointer(int i, int j, bool isRead) {
+	//1. 将(i,j)转换为unoerdered_map的下标值
+	int u_i = toUnorderedMapItemIndex(i);
+	int u_j = toUnorderedMapItemIndex(j);
+
+	// 进入PointerBlock中 (如果没有对应表项，unordered_map会自行创建一个)
+	// 当读模式下调用时，无需创建一个表项，返回0就行
+	//疑问：这里是线程安全的吗？
+	if (_m_data.count(std::tuple<int, int>(u_i, u_j)) == 0) {
+		if (isRead)
+		{
+			return nullptr;
+		}
+		PointerBlock temp(_m_PointerBlock_Res);
+		_m_data.emplace(std::tuple<int, int>(u_i, u_j), std::move(temp));
+	}
+	auto& curr_block = _m_data[std::tuple<int, int>(u_i, u_j)];
+
+	// 将(i,j)转换为PointerBlock的下标，如果当前指针为空，则申请内存，否则，进入指针所指Block中
+	int p_i = toPointerBlockIndex(i);
+	int p_j = toPointerBlockIndex(j);
+
+	if (!isRead)
+	{
+		curr_block.allocateMemory(p_i, p_j, _m_PointerBlock_Res, _m_DataBlock_Res, _compressInform);
+	}
+	return curr_block(p_i, p_j, _m_PointerBlock_Res);
+}
+
+
+
+template<class T>
+void MutiSparseGrid2<T>::rectifyCompressdNum() {
+	int &num = std::get<1>(_compressInform);
+	if (num == 3) num = 2;
+	else if (num > 4 && num < 8)num = 1;
+	else if (num == 1) num = 8;
+	else if (num == 2) num = 8;
+	else if (num == 4) num = 2;
+	else if (num == 8) num = 1;
+}
+
+
+
+
+
+
+
+/////////////////////////////////////////////////////////////////////
+#include <iostream>
+#include <string>
+#include<cmath>
+#include <vector>
+
+#include "grid/MutiSparseGrid2.hpp"
+
+using namespace std;
+
+
+int main() {
+
+    std::tuple<bool, int> state= std::make_tuple(false, 3);
+    
+    //如果要进行位压缩这里必须为无符号char，不然会报错
+    //MutiSparseGrid2<unsigned char> grid(20, 50, 10);
+    //（20，500，1）这个分辨率会出错
+    MutiSparseGrid2<int> grid(1, 50000, 1);
+    //MutiSparseGrid2<int> grid(1000, 1, 1);
+     
+    int k = 0;
+    typedef int cint;
+
+    vector<cint> tempVec;
+
+    int size =5000;
+    for (int i = 0; i < size; ++i)
+    {
+        tempVec.push_back(i);
+    }
+
+    //grid.write(0, 0, 0);
+    //grid.write(48, 0, 500);
+    //cout << grid.read(0, 0) << endl;
+
+
+    std::mutex mtx;
+//#pragma omp parallel for num_threads(20)
+    for (int i = 0; i < size; ++i) {
+         //mtx.lock();
+         grid.write(i, 0, tempVec[i]);
+         //mtx.unlock();
+    }
+
+//#pragma omp parallel for num_threads(12)
+     for (int i = 0; i < size; ++i) {
+         tempVec[i] = (int)(grid.read(i, 0));
+     }
+     
+     for (int i = 0; i < size; ++i) {
+         //cout<<i<<": " << (int)(grid.read(i, 0)) << endl;
+         if (i != (int)(grid.read(i, 0)))
+         {
+             cout<<"funck"<<endl;
+         }
+     }
+     
+     
+
+    return 0;
+}
+
+
+
+
+
+
+///////////////////////////////////////////////
+/*
+**序言
+* 这是titmouse2d的第一个头文件
+* 编写于2021.10.03
+**以上
+*/
+#ifndef VECTOR2_H
+#define VECTOR2_H
+
+#include <cmath>
+#include <iostream>
+
+
+template<class T>
+class Vector2 {
+public:
+	Vector2();
+
+	~Vector2();
+
+	Vector2(const T& _x, const T& _y);
+
+	//拷贝构造函数
+	Vector2(const Vector2<T>& var);
+
+	//用s来设置当前对象的属性
+	void set(const T& s);
+
+	//运算符重载
+	Vector2<T> operator+(const Vector2<T>& vec) const;
+
+	Vector2<T> operator-(const Vector2<T>& vec) const;
+
+	Vector2<T> operator*(const T& r) const;
+
+	Vector2<T> operator*(const Vector2<T>& r) const;
+
+	Vector2<T> operator/(const T& r) const;
+
+	//这里为何要写一个template呢？
+	//那是因为该函数只是一个友元函数而非成员函数
+	//所以需要我们去指定其为模板函数
+	template<typename T>
+	friend Vector2<T> operator* (const T& r, const Vector2<T>& obj);
+
+	Vector2<T> operator/(const Vector2<T>& r) const;
+
+	void operator=(const Vector2<T>& vec);
+
+	bool operator!=(const Vector2<T>& r)const;
+
+	bool operator==(const Vector2<T>& r)const;
+
+	Vector2<T> operator+=(const Vector2<T>& vec);
+
+	Vector2<T> operator-=(const Vector2<T>& vec);
+
+	Vector2<T> operator*=(const T& r);
+
+	Vector2<T> operator*=(const Vector2<T>& r);
+
+	Vector2<T> operator/=(const T& r);
+
+	Vector2<T> operator/=(const Vector2<T>& r);
+
+	//点积运算
+	T dot(const Vector2<T>& vec) const;
+
+	//获取向量长度
+	T getLength()const;
+
+	//获取向量长度的平方
+	T getLengthSquared()const;
+
+	//向量单位化，改变当前对象的属性
+	Vector2<T> normalize();
+
+	//获取单位化后的结果，但并不改变当前对象属性
+	Vector2<T> getNormalize()const;
+
+	//叉积运算
+	T cross(const Vector2<T>& vec)const;
+
+	//向量外积
+
+
+	//求两vector之间的距离，此时vector代表点
+	T dis(const Vector2<T>& vec)const;
+
+	//求两vector之间的距离的平方，此时vector代表点
+	T disSquare(const Vector2<T>& vec)const;
+
+	//求vector最小的分量
+	T min()const;
+
+	//返回(v,v)/this
+	Vector2<T> rdiv(const T& v)const;
+
+	//计算当前vector在normal上的投影
+	Vector2<T> projected(const Vector2<T>& normal) const;
+
+	static Vector2<T> zero() {
+		return Vector2<T>(0, 0);
+	}
+
+
+
+public:
+	T x;
+	T y;
+
+};
+
+using Vector2D = Vector2<double>;
+using Vector2F = Vector2<float>;
+using Vector2I = Vector2<int>;
+
+//template<class T>
+//std::ostream& operator<< (std::ostream& out, Vector2<T>& vec);
+
+////重载一个打印Vector2D的版本
+//template<class T>
+//inline std::ostream& operator<< (std::ostream& out, Vector2<T>& vec) {
+//	std::out << vec.x << " ," << vec.y << endl;
+//	return std::out;
+//}
+
+
+template<class T>
+Vector2<T>::Vector2() :
+	x(static_cast<T>(0)),
+	y(static_cast<T>(0)) {}
+
+
+template<class T>
+Vector2<T>::~Vector2() {
+
+}
+
+
+template<class T>
+Vector2<T>::Vector2(const T& _x, const T& _y) :
+	x(_x),
+	y(_y) {}
+
+
+template<class T>
+Vector2<T>::Vector2(const Vector2<T>& var) {
+	this->x = var.x;
+	this->y = var.y;
+}
+
+template<class T>
+void Vector2<T>::set(const T& s) {
+	this->x = s.x;
+	this->y = s.y;
+}
+
+template<class T>
+Vector2<T> Vector2<T>::operator+(const Vector2<T>& vec) const {
+	Vector2<T> result(this->x + vec.x, this->y + vec.y);
+	return result;
+}
+
+template<class T>
+Vector2<T> Vector2<T>::operator-(const Vector2<T>& vec) const {
+	Vector2<T> result(this->x - vec.x, this->y - vec.y);
+	return result;
+}
+
+template<class T>
+Vector2<T> Vector2<T>::operator*(const T& r) const {
+	Vector2<T> result(this->x * r, this->y * r);
+	return result;
+}
+
+template<class T>
+Vector2<T> Vector2<T>::operator*(const Vector2<T>& r) const {
+	Vector2<T> result(this->x * r.x, this->y * r.y);
+	return result;
+}
+
+template<class T>
+Vector2<T> Vector2<T>::operator/(const T& r) const {
+	Vector2<T> result(this->x / r, this->y / r);
+	return result;
+}
+
+template<class T>
+Vector2<T> operator* (const T& r, const Vector2<T>& obj) {
+	return obj * r;
+}
+
+template<class T>
+Vector2<T> Vector2<T>::operator/(const Vector2<T>& r) const {
+	Vector2<T> result(this->x / r.x, this->y / r.y);
+	return result;
+}
+
+template<class T>
+void Vector2<T>::operator=(const Vector2<T>& vec) {
+	this->x = vec.x;
+	this->y = vec.y;
+}
+
+
+//浮点数比较大小
+template<class T>
+bool Vector2<T>::operator!=(const Vector2<T>& r)const {
+	if (this->x == r.x && this->y == r.y) {
+		return false;
+	}
+	return true;
+}
+
+template<class T>
+bool Vector2<T>::operator==(const Vector2<T>& r)const {
+	if (this->x == r.x && this->y == r.y) {
+		return true;
+	}
+	return false;
+}
+
+template<class T>
+Vector2<T> Vector2<T>::operator+=(const Vector2<T>& vec) {
+	(*this) = (*this) + vec;
+	return *this;
+}
+
+template<class T>
+Vector2<T> Vector2<T>::operator-=(const Vector2<T>& vec) {
+	(*this) = (*this) - vec;
+	return *this;
+}
+
+template<class T>
+Vector2<T> Vector2<T>::operator*=(const T& r) {
+	(*this) = (*this) * r;
+	return *this;
+}
+
+template<class T>
+Vector2<T> Vector2<T>::operator*=(const Vector2<T>& r) {
+	(*this) = (*this) * r;
+	return *this;
+}
+
+template<class T>
+Vector2<T> Vector2<T>::operator/=(const T& r) {
+	(*this) = (*this) / r;
+	return *this;
+}
+
+template<class T>
+Vector2<T> Vector2<T>::operator/=(const Vector2<T>& r) {
+	(*this) = (*this) / r;
+	return *this;
+}
+
+template<class T>
+T Vector2<T>::dot(const Vector2<T>& vec) const {
+	return this->x * vec.x + this->y * vec.y;
+}
+
+template<class T>
+T Vector2<T>::getLength()const {
+	T length = sqrt(this->x * this->x + this->y * this->y);
+	return length;
+}
+
+
+template<class T>
+T Vector2<T>::getLengthSquared()const {
+	T length = (this->x * this->x + this->y * this->y);
+	return length;
+}
+
+template<class T>
+Vector2<T> Vector2<T>::normalize() {
+	double length = getLength();
+	if (length > 0) {
+		this->x /= length;
+		this->y /= length;
+	}
+
+	return *this;
+}
+
+template<class T>
+Vector2<T> Vector2<T>::getNormalize()const {
+	T length = getLength();
+	if (length > 0) {
+		return Vector2<T>(x / length, y / length);
+	}
+
+	return *this;
+}
+
+template<class T>
+T Vector2<T>::cross(const Vector2<T>& vec)const {
+	return (x * vec.y - vec.x * y);
+}
+
+template<class T>
+T Vector2<T>::dis(const Vector2<T>& vec)const {
+	auto result = sqrt((vec.x - x) * (vec.x - x) + (vec.y - y) * (vec.y - y));
+	return result;
+}
+
+template<class T>
+T Vector2<T>::disSquare(const Vector2<T>& vec)const {
+	return dis(vec) * dis(vec);
+}
+
+template<class T>
+T Vector2<T>::min()const {
+	return std::min(x, y);
+}
+
+template<class T>
+Vector2<T> Vector2<T>::rdiv(const T& v)const {
+	Vector2 result(v / this->x, v / this->y);
+	return result;
+}
+
+template<class T>
+Vector2<T> Vector2<T>::projected(const Vector2<T>& normal) const {
+	return *this - (normal * (this->dot(normal)));
+}
+
+#endif
